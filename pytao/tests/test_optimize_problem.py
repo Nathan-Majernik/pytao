@@ -363,6 +363,7 @@ def test_compute_datum_delta_matches_tao_merit_types(merit_type, model, meas, ex
         model_value=model,
         design_value=0.0,
         weight=1.0,
+        global_index=1,
     )
     assert _compute_datum_delta(d) == pytest.approx(expected)
 
@@ -391,18 +392,47 @@ def test_residuals_sum_of_squares_equals_merit():
 
 
 def test_jacobian_passes_through_derivative_matrix():
+    """Active quad[1] (global 1) and quad[2] (global 2); quad[3] is inactive
+    but still sized into the full matrix — same (2,2) result is expected."""
     tao = _simple_problem_tao()
-    expected = np.array([[1.0, 2.0], [3.0, 4.0]])
-    tao.derivative_matrix = {1: expected}
+    # Tao's derivative() returns a matrix sized by max global index, so with
+    # 3 vars declared (1 inactive) the full matrix is 2×3; the inactive column
+    # can hold NaN.
+    full = np.array([[1.0, 2.0, np.nan], [3.0, 4.0, np.nan]])
+    tao.derivative_matrix = {1: full}
     p = TaoOptimizationProblem(tao)
-    np.testing.assert_array_equal(p.jacobian(), expected)
+    np.testing.assert_array_equal(p.jacobian(), np.array([[1.0, 2.0], [3.0, 4.0]]))
 
 
-def test_jacobian_raises_on_shape_mismatch():
+def test_jacobian_raises_when_indices_exceed_matrix():
     tao = _simple_problem_tao()
-    tao.derivative_matrix = {1: np.ones((3, 5))}  # wrong shape
+    # Matrix too small — can't contain active indices.
+    tao.derivative_matrix = {1: np.ones((1, 1))}
     p = TaoOptimizationProblem(tao)
-    with pytest.raises(ValueError, match="returned shape"):
+    with pytest.raises(ValueError, match="active indices extend"):
+        p.jacobian()
+
+
+def test_jacobian_projects_sparse_active_indices():
+    """Reviewer's repro: an inactive leading datum shifts global indices."""
+    tao = _simple_problem_tao()
+    # Mark the first datum inactive. Remaining active: ix_d1=2, global_index=2.
+    tao.d_arrays[("twiss", "end")][0]["useit_opt"] = False
+    # Full matrix is shape (2 datums total × 2 active vars × plus the
+    # inactive 3rd var column filled with NaN) = (2, 3). Active datum row
+    # is global index 2 → row index 1 in the full matrix.
+    tao.derivative_matrix = {1: np.array([[np.nan, np.nan, np.nan], [5.0, 6.0, np.nan]])}
+    p = TaoOptimizationProblem(tao)
+    assert p.n_data == 1
+    assert p.datums[0].global_index == 2
+    np.testing.assert_array_equal(p.jacobian(), np.array([[5.0, 6.0]]))
+
+
+def test_jacobian_raises_on_nan_in_active_region():
+    tao = _simple_problem_tao()
+    tao.derivative_matrix = {1: np.array([[1.0, np.nan, 0.0], [3.0, 4.0, 0.0]])}
+    p = TaoOptimizationProblem(tao)
+    with pytest.raises(ValueError, match="NaN"):
         p.jacobian()
 
 
@@ -416,8 +446,8 @@ def test_jacobian_raises_when_universe_missing():
 
 def test_residual_jacobian_scales_by_sqrt_weight():
     tao = _simple_problem_tao()
-    # Identity model-jacobian so residual jac = diag(sqrt(w))
-    tao.derivative_matrix = {1: np.array([[1.0, 0.0], [0.0, 1.0]])}
+    # Identity model-jacobian (extended with NaN for the inactive 3rd var col).
+    tao.derivative_matrix = {1: np.array([[1.0, 0.0, np.nan], [0.0, 1.0, np.nan]])}
     tao.merit_fn = lambda t: 0.0
     p = TaoOptimizationProblem(tao)
     J = p.residual_jacobian(p.x0)
@@ -434,11 +464,195 @@ def test_residual_jacobian_zeroes_inactive_bound_rows():
     row = tao.d_arrays[("twiss", "end")][0]
     row["merit_type"] = "max"
     row["meas_value"] = 50.0  # bound; model=10 < 50 → delta=0
-    tao.derivative_matrix = {1: np.ones((2, 2))}
+    tao.derivative_matrix = {1: np.ones((2, 3))}
     tao.merit_fn = lambda t: 0.0
     p = TaoOptimizationProblem(tao)
     J = p.residual_jacobian(p.x0)
     np.testing.assert_array_equal(J[0], np.zeros(2))
+
+
+# ---- limit-type variable residual contributions -----------------------
+
+
+def _limit_var_tao(low: float = -1.0, high: float = 1.0, model: float = 2.0) -> FakeTao:
+    """FakeTao with one limit-type variable and no datums."""
+    tao = FakeTao()
+    tao.var_general_rows = [{"name": "q", "line": "", "lbound": 1, "ubound": 1}]
+    tao.var_v_array_rows = {
+        "q": [
+            {
+                "ix_v1": 1,
+                "var_attrib_name": "k1",
+                "meas_value": 0.0,
+                "model_value": model,
+                "design_value": model,
+                "useit_opt": True,
+                "good_user": True,
+                "weight": 4.0,
+            }
+        ]
+    }
+    tao.var_detail = {
+        "q[1]": {
+            "model_value": model,
+            "low_lim": low,
+            "high_lim": high,
+            "step": 1e-4,
+            "weight": 4.0,
+            "merit_type": "limit",
+            "ele_name": "Q",
+            "attrib_name": "k1",
+        }
+    }
+    # No datums — tests focus on the variable-only contribution.
+    tao.d2_names = []
+    return tao
+
+
+def test_evaluate_residuals_includes_limit_variable_contribution():
+    """Regression for the reviewer's blocker: sum(r**2) must equal merit."""
+    # x = 2.0, high = 1.0 → delta = 1.0, weight = 4 → merit = 4, r_limit = 2.
+    tao = _limit_var_tao(low=-1.0, high=1.0, model=2.0)
+    tao.merit_fn = lambda t: 4.0
+    p = TaoOptimizationProblem(tao)
+    r = p.evaluate_residuals(p.x0)
+    # n_data = 0, n_limit_var = 1 → shape (1,)
+    assert r.shape == (1,)
+    np.testing.assert_allclose(r[0], 2.0)
+    np.testing.assert_allclose(np.sum(r**2), p.evaluate_merit(p.x0))
+
+
+def test_evaluate_residuals_zero_when_limit_variable_inside_box():
+    tao = _limit_var_tao(low=-5.0, high=5.0, model=0.5)
+    tao.merit_fn = lambda t: 0.0
+    p = TaoOptimizationProblem(tao)
+    r = p.evaluate_residuals(p.x0)
+    np.testing.assert_array_equal(r, [0.0])
+
+
+def test_evaluate_residuals_signed_for_lower_bound_violation():
+    # Below low → negative delta; residual inherits that sign.
+    tao = _limit_var_tao(low=-1.0, high=1.0, model=-3.0)
+    tao.merit_fn = lambda t: 4.0 * (2.0) ** 2  # weight * delta^2 = 4*4 = 16
+    p = TaoOptimizationProblem(tao)
+    r = p.evaluate_residuals(p.x0)
+    np.testing.assert_allclose(r[0], -4.0)
+
+
+def test_residual_jacobian_has_rows_for_limit_variables():
+    """The residual jac must have (n_data + n_limit_var) rows."""
+    # Build a problem with 1 target datum + 1 limit variable.
+    tao = FakeTao()
+    tao.var_general_rows = [{"name": "q", "line": "", "lbound": 1, "ubound": 1}]
+    tao.var_v_array_rows = {
+        "q": [
+            {
+                "ix_v1": 1,
+                "var_attrib_name": "k1",
+                "meas_value": 0.0,
+                "model_value": 2.0,
+                "design_value": 2.0,
+                "useit_opt": True,
+                "good_user": True,
+                "weight": 4.0,
+            }
+        ]
+    }
+    tao.var_detail = {
+        "q[1]": {
+            "model_value": 2.0,
+            "low_lim": -1.0,
+            "high_lim": 1.0,
+            "step": 1e-4,
+            "weight": 4.0,
+            "merit_type": "limit",
+            "ele_name": "Q",
+            "attrib_name": "k1",
+        }
+    }
+    tao.d2_names = ["d"]
+    tao.d1_arrays = {"d": [{"name": "end"}]}
+    tao.d_arrays = {
+        ("d", "end"): [
+            {
+                "ix_d1": 1,
+                "data_type": "x",
+                "merit_type": "target",
+                "ele_ref_name": "",
+                "ele_start_name": "",
+                "ele_name": "END",
+                "meas_value": 0.0,
+                "model_value": 2.0,
+                "design_value": 0.0,
+                "useit_opt": True,
+                "useit_plot": True,
+                "good_user": True,
+                "weight": 1.0,
+                "exists": True,
+            }
+        ]
+    }
+    tao.derivative_matrix = {1: np.array([[1.0]])}  # dModel/dVar
+    tao.merit_fn = lambda t: 0.0
+    p = TaoOptimizationProblem(tao)
+    J = p.residual_jacobian(p.x0)
+    # Shape: (1 data + 1 limit var, 1 var)
+    assert J.shape == (2, 1)
+    # Limit-var row: sign(delta) * sqrt(weight) = +1 * sqrt(4) = 2 on var col.
+    np.testing.assert_allclose(J[1, 0], 2.0)
+
+
+# ---- weight validation -------------------------------------------------
+
+
+def test_negative_datum_weight_is_rejected():
+    tao = _simple_problem_tao()
+    tao.d_arrays[("twiss", "end")][0]["weight"] = -1.0
+    with pytest.raises(ValueError, match="negative weight"):
+        TaoOptimizationProblem(tao)
+
+
+def test_negative_variable_weight_is_rejected():
+    tao = _simple_problem_tao()
+    tao.var_detail["quad[1]"]["weight"] = -2.0
+    with pytest.raises(ValueError, match="negative weight"):
+        TaoOptimizationProblem(tao)
+
+
+# ---- batched set_variables --------------------------------------------
+
+
+class _FakeTaoWithCmds(FakeTao):
+    """FakeTao that also implements cmds() so we can verify batching."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.batched_calls: list[tuple[tuple, dict]] = []
+
+    def cmds(self, cmds, **kwargs):
+        self.batched_calls.append((tuple(cmds), dict(kwargs)))
+        # Replay each one through cmd() to keep the model_value bookkeeping.
+        for c in cmds:
+            self.cmd(c)
+        return []
+
+
+def test_set_variables_uses_cmds_when_available():
+    tao = _FakeTaoWithCmds()
+    # Reuse the simple-problem fixture's data on this subclass.
+    simple = _simple_problem_tao()
+    tao.var_general_rows = simple.var_general_rows
+    tao.var_v_array_rows = simple.var_v_array_rows
+    tao.var_detail = simple.var_detail
+    tao.d2_names = simple.d2_names
+    tao.d1_arrays = simple.d1_arrays
+    tao.d_arrays = simple.d_arrays
+    p = TaoOptimizationProblem(tao)
+    p.set_variables(np.array([1.1, 2.2]))
+    assert len(tao.batched_calls) == 1
+    commands, kwargs = tao.batched_calls[0]
+    assert len(commands) == 2
+    assert kwargs.get("suppress_lattice_calc") is True
 
 
 # ---- _finite_limit low-level sanity -----------------------------------
@@ -467,6 +681,7 @@ def test_variable_info_is_frozen():
         merit_type="target",
         ele_name="Q1",
         attrib_name="k1",
+        global_index=1,
     )
     with pytest.raises(Exception):  # FrozenInstanceError
         v.initial_value = 1.0  # type: ignore[misc]

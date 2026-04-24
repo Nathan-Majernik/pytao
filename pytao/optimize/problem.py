@@ -38,6 +38,10 @@ class _TaoLike(Protocol):
     def merit(self, *, raises: bool = True) -> float: ...
     def derivative(self, *, raises: bool = True) -> dict[int, np.ndarray]: ...
 
+    # Optional — ``set_variables`` uses cmds() when available but falls back
+    # to cmd() in a loop otherwise. Kept out of the Protocol so stubs don't
+    # have to implement it.
+
 
 @dataclass(frozen=True)
 class VariableInfo:
@@ -70,6 +74,10 @@ class VariableInfo:
         Name of the lattice element the variable operates on, if any.
     attrib_name : str
         Attribute being varied (e.g. ``"k1"``).
+    global_index : int
+        One-based position in Tao's canonical v1 → ix_v1 enumeration
+        (including inactive variables). Matches the ``ix_var`` column index
+        Tao uses in its ``derivative()`` matrix.
     """
 
     name: str
@@ -83,6 +91,7 @@ class VariableInfo:
     merit_type: str
     ele_name: str
     attrib_name: str
+    global_index: int
 
 
 @dataclass(frozen=True)
@@ -108,6 +117,10 @@ class DatumInfo:
         Target value, current value, and the design reference.
     weight : float
         Merit weight (applied as ``weight * delta**2``).
+    global_index : int
+        One-based global datum index within the universe (the ``ix_data`` Tao
+        uses to key ``derivative()`` rows). Computed by enumerating datums in
+        Tao's canonical d2 → d1 → ix_d1 order.
     """
 
     name: str
@@ -120,6 +133,7 @@ class DatumInfo:
     model_value: float
     design_value: float
     weight: float
+    global_index: int
 
 
 @dataclass
@@ -169,6 +183,8 @@ class TaoOptimizationProblem:
         self.variables = _collect_active_variables(self.tao)
         self.datums = _collect_active_datums(self.tao, self.universe)
         self._x0 = np.array([v.initial_value for v in self.variables], dtype=float)
+        self._derivative_recalc_warned = False
+        _validate_weights(self.variables, self.datums)
         if not self.variables:
             logger.warning(
                 "TaoOptimizationProblem built with no active variables "
@@ -232,6 +248,12 @@ class TaoOptimizationProblem:
         """
         Push a variable vector into Tao's model.
 
+        Commands are issued via :meth:`~pytao.Tao.cmds` when available, which
+        suppresses lattice recalculation between each ``set var`` — a single
+        recalculation happens the next time Tao reads the model (e.g. the
+        following ``merit()`` call). For a Tao-shaped object that doesn't
+        expose ``cmds``, falls back to an un-batched loop.
+
         Parameters
         ----------
         x : ndarray, shape (n_var,)
@@ -243,8 +265,16 @@ class TaoOptimizationProblem:
         x = np.asarray(x, dtype=float)
         if x.shape != (self.n_var,):
             raise ValueError(f"set_variables expected shape ({self.n_var},), got {x.shape}")
-        for var, value in zip(self.variables, x, strict=True):
-            self.tao.cmd(f"set var {var.name}|model = {value:.17g}")
+        commands = [
+            f"set var {var.name}|model = {value:.17g}"
+            for var, value in zip(self.variables, x, strict=True)
+        ]
+        cmds_method = getattr(self.tao, "cmds", None)
+        if callable(cmds_method):
+            cmds_method(commands, suppress_lattice_calc=True, suppress_plotting=True)
+        else:
+            for command in commands:
+                self.tao.cmd(command)
 
     def evaluate_merit(self, x: np.ndarray) -> float:
         """
@@ -255,6 +285,11 @@ class TaoOptimizationProblem:
         self.set_variables(x)
         return float(self.tao.merit())
 
+    @property
+    def limit_variables(self) -> list[VariableInfo]:
+        """Active variables whose merit_type is ``'limit'``."""
+        return [v for v in self.variables if v.merit_type == "limit"]
+
     def evaluate_residuals(self, x: np.ndarray) -> np.ndarray:
         """
         Set the variables to ``x`` and return the weighted residual vector.
@@ -264,28 +299,44 @@ class TaoOptimizationProblem:
         r : ndarray, shape (n_data + n_limit_var,)
             Residuals such that ``sum(r**2)`` equals Tao's merit function.
             Datum contributions come first, in :attr:`datums` order, followed
-            by limit-type variable contributions.
+            by contributions from each active variable with
+            ``merit_type == 'limit'`` (in :attr:`variables` order).
 
         Notes
         -----
-        ``r_i = sqrt(w_i) * delta_i`` where ``delta_i`` is defined by the
-        datum's ``merit_type`` (see :mod:`tao`'s optimization chapter). For
-        ``"target"`` datums this is ``model - meas``. For bound-style merit
-        types (``"min"``, ``"max"``, ``"abs_min"``, ``"abs_max"``) the delta is
-        zero when the bound is satisfied — the constraint is soft by
-        construction.
+        For datums: ``r_i = sqrt(w_i) * delta_i`` where ``delta_i`` is defined
+        by the datum's ``merit_type`` (see the Tao optimization chapter). For
+        ``"target"`` datums this is ``model - meas``; for bound-style merit
+        types (``"min"``, ``"max"``, ``"abs_min"``, ``"abs_max"``) the delta
+        is zero when the bound is satisfied.
+
+        For variables with ``merit_type == 'limit'``: the delta is the signed
+        bound violation (``model - high_lim`` when above, ``model - low_lim``
+        when below, else zero). Variables with ``merit_type == 'target'`` do
+        not contribute to the merit.
         """
         self.set_variables(x)
-        datums = _fetch_datum_model_values(self.tao, self.datums, self.universe)
-        residuals = np.empty(self.n_data, dtype=float)
-        for i, d in enumerate(datums):
+        datum_snapshot = _fetch_datum_model_values(self.tao, self.datums, self.universe)
+        residuals = np.empty(self.n_data + len(self.limit_variables), dtype=float)
+        for i, d in enumerate(datum_snapshot):
             delta = _compute_datum_delta(d)
             residuals[i] = math.copysign(math.sqrt(d.weight) * abs(delta), delta)
+        offset = self.n_data
+        for j, (var, value) in enumerate(
+            zip(self.limit_variables, self._limit_values_from(x), strict=True)
+        ):
+            delta = _compute_variable_limit_delta(var, value)
+            residuals[offset + j] = math.copysign(math.sqrt(var.weight) * abs(delta), delta)
         return residuals
 
     def jacobian(self, x: np.ndarray | None = None) -> np.ndarray:
         """
         Return ``dModel_dVar`` for the active datums and variables.
+
+        Slices the full derivative matrix returned by :meth:`Tao.derivative`
+        (which is sized by the *maximum* global datum / variable index, with
+        NaN entries for inactive slots) down to the active subset using the
+        ``global_index`` attributes captured at construction.
 
         Parameters
         ----------
@@ -296,10 +347,11 @@ class TaoOptimizationProblem:
         Returns
         -------
         J : ndarray, shape (n_data, n_var)
-            Tao-computed derivative matrix for the given universe.
+            Derivative matrix for active datums/variables only.
         """
         if x is not None:
             self.set_variables(x)
+        self._warn_if_derivative_recalc_off()
         deriv = self.tao.derivative()
         if self.universe not in deriv:
             raise KeyError(
@@ -308,36 +360,49 @@ class TaoOptimizationProblem:
                 f"derivative_recalc = T` before optimizing?"
             )
         full = np.asarray(deriv[self.universe], dtype=float)
-        # Tao's pipe derivative returns a matrix keyed by global data/var
-        # indices. The active-subset projection is expressed via the flags we
-        # already filtered on — for most setups the full matrix's rows/columns
-        # align with (active_datums, active_variables) because Tao only emits
-        # rows/cols for ``useit_opt`` entries. If the shape disagrees, trust
-        # the user's geometry instead of silently truncating.
-        if full.shape != (self.n_data, self.n_var):
+        if self.n_data == 0 or self.n_var == 0:
+            return np.zeros((self.n_data, self.n_var), dtype=float)
+
+        row_ix = np.fromiter((d.global_index - 1 for d in self.datums), dtype=int)
+        col_ix = np.fromiter((v.global_index - 1 for v in self.variables), dtype=int)
+        if (row_ix < 0).any() or (col_ix < 0).any():
             raise ValueError(
-                f"derivative() returned shape {full.shape}, expected "
-                f"({self.n_data}, {self.n_var}). This usually means some "
-                "datums or variables toggled their useit_opt flag between "
-                "problem construction and jacobian evaluation."
+                "global_index must be >= 1 for every active var/datum; got "
+                f"row={row_ix.tolist()} col={col_ix.tolist()}"
             )
-        return full
+        if row_ix.max(initial=-1) >= full.shape[0] or col_ix.max(initial=-1) >= full.shape[1]:
+            raise ValueError(
+                f"derivative() returned shape {full.shape}, but active "
+                f"indices extend to row={row_ix.max():d}+1, col={col_ix.max():d}+1. "
+                "The active set likely changed after the problem was built."
+            )
+        projected = full[row_ix[:, None], col_ix[None, :]]
+        if np.isnan(projected).any():
+            raise ValueError(
+                "derivative() returned NaN for at least one active "
+                "(datum, variable) pair. Ensure `set global "
+                "derivative_recalc = T` and that the datums are actually "
+                "differentiable by Tao."
+            )
+        return projected
 
     def residual_jacobian(self, x: np.ndarray | None = None) -> np.ndarray:
         """
         Jacobian of :meth:`evaluate_residuals` w.r.t. the variable vector.
 
-        For ``"target"`` datums, ``d(r_i)/d(x_j) = sqrt(w_i) * dModel/dVar``;
-        for bound-style merit types the derivative is zero when the bound is
-        satisfied. We compute the model-value Jacobian from Tao, then scale by
-        ``sqrt(weight)`` and mask bound rows that are inactive.
+        Shape is ``(n_data + n_limit_var, n_var)``. For ``"target"`` datum
+        rows, ``d(r_i)/d(x_j) = sqrt(w_i) * dModel/dVar``; for bound-style
+        merit types the row is zero when the bound is satisfied. For
+        ``merit_type == 'limit'`` variable rows, ``d(r_i)/d(x_j)`` is
+        ``sqrt(w) * sign(delta) * δ_{ij}`` when the variable is violating
+        one of its bounds, zero otherwise.
         """
         if x is not None:
             self.set_variables(x)
-        J_model = self.jacobian()  # (n_data, n_var)
-        datums = _fetch_datum_model_values(self.tao, self.datums, self.universe)
+        J_model = self.jacobian()
+        datum_snapshot = _fetch_datum_model_values(self.tao, self.datums, self.universe)
         scale = np.empty(self.n_data, dtype=float)
-        for i, d in enumerate(datums):
+        for i, d in enumerate(datum_snapshot):
             delta = _compute_datum_delta(d)
             if delta == 0.0 and d.merit_type != "target":
                 scale[i] = 0.0
@@ -346,7 +411,56 @@ class TaoOptimizationProblem:
                 if d.merit_type in {"abs_max", "abs_min"} and d.model_value < 0:
                     sign = -1.0
                 scale[i] = sign * math.sqrt(d.weight)
-        return scale[:, None] * J_model
+        J_data = scale[:, None] * J_model
+
+        if not self.limit_variables:
+            return J_data
+
+        # Each limit-type variable row has a single non-zero column: the one
+        # corresponding to that variable in x.
+        x_current = np.asarray(x if x is not None else self.x0, dtype=float)
+        var_ix_in_x = {var.name: k for k, var in enumerate(self.variables)}
+        J_var = np.zeros((len(self.limit_variables), self.n_var), dtype=float)
+        for j, (var, value) in enumerate(
+            zip(self.limit_variables, self._limit_values_from(x_current), strict=True)
+        ):
+            delta = _compute_variable_limit_delta(var, value)
+            if delta == 0.0:
+                continue
+            sign = 1.0 if delta > 0 else -1.0
+            J_var[j, var_ix_in_x[var.name]] = sign * math.sqrt(var.weight)
+        return np.vstack([J_data, J_var])
+
+    def _limit_values_from(self, x: np.ndarray | None) -> np.ndarray:
+        """Return the current values of limit-type variables given optimizer state."""
+        if x is None:
+            x = self.x0
+        x = np.asarray(x, dtype=float).ravel()
+        out = np.empty(len(self.limit_variables), dtype=float)
+        for j, var in enumerate(self.limit_variables):
+            ix = next(i for i, v in enumerate(self.variables) if v.name == var.name)
+            out[j] = x[ix]
+        return out
+
+    def _warn_if_derivative_recalc_off(self) -> None:
+        """Emit a one-shot warning if Tao's ``derivative_recalc`` is off."""
+        if self._derivative_recalc_warned:
+            return
+        try:
+            tao_global = self.tao.cmd("pipe global")  # type: ignore[attr-defined]
+        except Exception:
+            return
+        on = any(
+            "derivative_recalc" in line and "T" in line.split(";")[-1].strip().upper()
+            for line in tao_global
+        )
+        if not on:
+            logger.warning(
+                "Tao's global%%derivative_recalc appears to be False; "
+                "`jacobian()` may return stale entries. Consider "
+                "`tao.cmd('set global derivative_recalc = T')`."
+            )
+        self._derivative_recalc_warned = True
 
     def reset(self) -> None:
         """Restore variables to their values when the problem was constructed."""
@@ -398,13 +512,53 @@ def _compute_datum_delta(d: DatumInfo) -> float:
     return m - t
 
 
+def _compute_variable_limit_delta(var: VariableInfo, value: float) -> float:
+    """
+    Signed bound violation for a ``merit_type == 'limit'`` variable.
+
+    Returns ``value - high_lim`` when above the upper limit, ``value - low_lim``
+    (negative) when below the lower limit, and ``0`` inside the box. Mirrors
+    the contribution Tao adds to its merit function for limit-type variables.
+    """
+    if value > var.high_lim:
+        return value - var.high_lim
+    if value < var.low_lim:
+        return value - var.low_lim
+    return 0.0
+
+
+def _validate_weights(variables: list[VariableInfo], datums: list[DatumInfo]) -> None:
+    """Weights must be non-negative so ``sqrt(weight)`` stays real."""
+    for d in datums:
+        if d.weight < 0:
+            raise ValueError(
+                f"Datum {d.name!r} has negative weight {d.weight!r}; "
+                "Tao's merit requires non-negative weights."
+            )
+    for v in variables:
+        if v.weight < 0:
+            raise ValueError(
+                f"Variable {v.name!r} has negative weight {v.weight!r}; "
+                "Tao's merit requires non-negative weights."
+            )
+
+
 def _collect_active_variables(tao: _TaoLike) -> list[VariableInfo]:
-    """Enumerate every ``useit_opt == True`` variable from Tao."""
+    """
+    Enumerate every ``useit_opt == True`` variable from Tao.
+
+    The ``global_index`` is the one-based position in Tao's canonical
+    v1 → ix_v1 enumeration (including inactive variables), matching the
+    ``ix_var`` column index in ``derivative()``'s matrix.
+    """
     results: list[VariableInfo] = []
+    counter = 0
     for v1 in tao.var_general():
         v1_name = v1["name"]
         rows = tao.var_v_array(v1_name)
-        for row in rows:
+        rows_sorted = sorted(rows, key=lambda r: int(r["ix_v1"]))
+        for row in rows_sorted:
+            counter += 1
             if not row.get("useit_opt", False):
                 continue
             ix_v1 = int(row["ix_v1"])
@@ -425,14 +579,22 @@ def _collect_active_variables(tao: _TaoLike) -> list[VariableInfo]:
                     merit_type=str(detail.get("merit_type", "target")),
                     ele_name=str(detail.get("ele_name", "")),
                     attrib_name=str(detail.get("attrib_name", row.get("var_attrib_name", ""))),
+                    global_index=counter,
                 )
             )
     return results
 
 
 def _collect_active_datums(tao: _TaoLike, universe: int) -> list[DatumInfo]:
-    """Enumerate every ``useit_opt == True`` datum for ``universe``."""
+    """
+    Enumerate every ``useit_opt == True`` datum for ``universe``.
+
+    The ``global_index`` is the one-based position in Tao's canonical
+    d2 → d1 → ix_d1 enumeration (including inactive datums), matching the
+    ``ix_data`` row index in ``derivative()``'s matrix.
+    """
     results: list[DatumInfo] = []
+    counter = 0
     for d2 in tao.data_d2_array(str(universe)):
         d2_name = d2 if isinstance(d2, str) else d2.get("name", "")
         if not d2_name:
@@ -441,7 +603,9 @@ def _collect_active_datums(tao: _TaoLike, universe: int) -> list[DatumInfo]:
         for d1 in tao.data_d1_array(d2_ref):
             d1_name = d1["name"] if isinstance(d1, dict) else d1
             rows = tao.data_d_array(d2_name, d1_name, ix_uni=str(universe))
-            for row in rows:
+            rows_sorted = sorted(rows, key=lambda r: int(r["ix_d1"]))
+            for row in rows_sorted:
+                counter += 1
                 if not row.get("useit_opt", False):
                     continue
                 ix_d1 = int(row["ix_d1"])
@@ -457,6 +621,7 @@ def _collect_active_datums(tao: _TaoLike, universe: int) -> list[DatumInfo]:
                         model_value=float(row["model_value"]),
                         design_value=float(row["design_value"]),
                         weight=float(row.get("weight", 0.0)),
+                        global_index=counter,
                     )
                 )
     return results
@@ -494,6 +659,7 @@ def _fetch_datum_model_values(
                 model_value=float(row["model_value"]),
                 design_value=float(row["design_value"]),
                 weight=float(row.get("weight", d.weight)),
+                global_index=d.global_index,
             )
     # Preserve the original datum ordering so the residual vector lines up
     # with the problem's declared datum order.

@@ -1,3 +1,44 @@
+# Unreleased
+
+## New Features
+
+### Python-driven optimization (`pytao.optimize`)
+
+A new subpackage lets users drive Tao optimization from external optimizer
+libraries (`scipy.optimize`, and anything else consuming Python callables)
+while honouring the variables, bounds, weights, and constraint-style datums
+declared in a `tao.init` file.
+
+- **`TaoOptimizationProblem`** — snapshot of a live Tao instance that
+  enumerates active variables and datums (`useit_opt == True`), translates
+  Tao's ±1e30 "no limit" sentinels to ±inf, and exposes
+  `evaluate_merit(x)`, `evaluate_residuals(x)` (with `sum(r**2) == merit`
+  including any `merit_type == 'limit'` variables), `jacobian(x)` and
+  `residual_jacobian(x)` built on Tao's `derivative()` command, and
+  `set_variables(x)` (batched through `tao.cmds` to skip per-variable
+  lattice recalculations).
+
+- **`run_scipy_minimize`** / **`run_scipy_least_squares`** — adapters that
+  drive `scipy.optimize.minimize` and `scipy.optimize.least_squares`
+  respectively. Bounded methods automatically receive `problem.bounds`.
+  `least_squares` can consume Tao's analytic Jacobian via
+  `use_jacobian=True`.
+
+  ```python
+  from pytao import Tao
+  from pytao.optimize import TaoOptimizationProblem, run_scipy_minimize
+
+  tao = Tao(init_file="tao.init", noplot=True)
+  problem = TaoOptimizationProblem(tao)
+  result = run_scipy_minimize(problem, method="L-BFGS-B")
+  ```
+
+- **Optional dependency** — scipy is an extra: `pip install pytao[optimize]`.
+  The read-only parts of `TaoOptimizationProblem` (enumeration, bounds,
+  merit evaluation, residuals, Jacobians) work without it.
+
+See the [optimization guide](optimize.md) for a full walkthrough.
+
 # v1.0.0
 
 ## New Features

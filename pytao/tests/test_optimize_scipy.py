@@ -323,3 +323,29 @@ def test_residuals_callable_matches_evaluate_residuals():
     r = problem.scipy_residuals_callable()
     x = np.array([0.25, 0.75])
     np.testing.assert_array_equal(r(x), problem.evaluate_residuals(x))
+
+
+# ---- docs snippet regression: differential_evolution ---------------------
+
+
+def test_differential_evolution_snippet_works():
+    """
+    docs/optimize.md shows calling scipy.optimize.differential_evolution
+    directly (not via minimize(method=...)). Verify the documented pattern.
+    """
+    from scipy.optimize import differential_evolution
+
+    tao, problem = _make_two_var_problem(
+        limits_1=(-5.0, 5.0), limits_2=(-5.0, 5.0), initial=(0.0, 0.0)
+    )
+    result = differential_evolution(
+        problem.evaluate_merit,
+        bounds=problem.bounds,
+        x0=problem.x0,
+        tol=1e-8,
+        seed=0,
+        polish=True,
+        maxiter=200,
+    )
+    problem.set_variables(result.x)
+    np.testing.assert_allclose(result.x, [1.0, -0.5], atol=1e-3)

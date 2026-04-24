@@ -82,10 +82,28 @@ result = run_scipy_minimize(
 
 # Gradient-free — useful for noisy / non-smooth merits.
 result = run_scipy_minimize(problem, method="Nelder-Mead")
-
-# Global — handy when your lattice has multiple local minima.
-result = run_scipy_minimize(problem, method="differential_evolution")
 ```
+
+`scipy.optimize.minimize` accepts any of its documented methods here:
+`"L-BFGS-B"`, `"TNC"`, `"SLSQP"`, `"Powell"`, `"trust-constr"`,
+`"Nelder-Mead"`, `"COBYLA"`, `"COBYQA"` honour ``problem.bounds``; other
+methods are run unbounded (a log message is emitted).
+
+For global optimizers that live outside ``minimize`` — e.g.
+[`scipy.optimize.differential_evolution`][de] — call them directly:
+
+```python
+from scipy.optimize import differential_evolution
+
+result = differential_evolution(
+    problem.evaluate_merit,
+    bounds=problem.bounds,
+    x0=problem.x0,
+)
+problem.set_variables(result.x)  # leave Tao at the final point
+```
+
+[de]: https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.differential_evolution.html
 
 Bounded methods automatically receive `problem.bounds`; unbounded methods
 get a log message explaining that bounds were dropped.
@@ -180,6 +198,16 @@ pip install pytao scipy
 The read-only parts of `TaoOptimizationProblem` (enumeration, bounds, merit
 evaluation, residual vectors, Jacobians) work without SciPy. Only the
 `run_scipy_*` adapters require it.
+
+## Runnable benchmark
+
+[`docs/examples/optimize.py`](examples/optimize.py) in the pytao source tree
+is a standalone script that runs Tao's built-in `lmdif` alongside
+`run_scipy_minimize` and `run_scipy_least_squares` (both finite-difference
+and with Tao's analytic Jacobian) against the same packaged init file, and
+prints a side-by-side comparison of final merit and forward-evaluation
+counts. Run it with `python docs/examples/optimize.py` from a clone of the
+pytao repo (a working Tao binary is required).
 
 ## See also
 
