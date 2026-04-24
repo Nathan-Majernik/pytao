@@ -539,6 +539,27 @@ def test_evaluate_residuals_signed_for_lower_bound_violation():
     np.testing.assert_allclose(r[0], -4.0)
 
 
+def test_residual_jacobian_reads_live_state_when_x_is_none():
+    """
+    Reviewer repro: construct with x0 = 2.0 (outside bounds), then move the
+    live Tao state to 0.0 (inside bounds). residual_jacobian() with no x must
+    use the live state, so the limit-variable row is all zeros (delta = 0).
+    """
+    tao = _limit_var_tao(low=-1.0, high=1.0, model=2.0)
+    tao.merit_fn = lambda t: 0.0
+    # Derivative matrix is 0x1 because there are no datums; jacobian()
+    # returns shape (0, 1). FakeTao's derivative() dict can be empty — we
+    # populate it just enough to satisfy the universe lookup.
+    tao.derivative_matrix = {1: np.zeros((0, 1))}
+    p = TaoOptimizationProblem(tao)
+    # Move Tao's live state inside the box — x0 stays at 2.0.
+    p.set_variables(np.array([0.0]))
+    J = p.residual_jacobian()  # no explicit x
+    # 0 datum rows + 1 limit-var row; limit is satisfied now → row of zeros.
+    assert J.shape == (1, 1)
+    np.testing.assert_array_equal(J, np.zeros((1, 1)))
+
+
 def test_residual_jacobian_has_rows_for_limit_variables():
     """The residual jac must have (n_data + n_limit_var) rows."""
     # Build a problem with 1 target datum + 1 limit variable.

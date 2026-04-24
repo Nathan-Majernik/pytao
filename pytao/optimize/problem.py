@@ -417,12 +417,18 @@ class TaoOptimizationProblem:
             return J_data
 
         # Each limit-type variable row has a single non-zero column: the one
-        # corresponding to that variable in x.
-        x_current = np.asarray(x if x is not None else self.x0, dtype=float)
+        # corresponding to that variable in x. Use Tao's current live state
+        # when no explicit x was passed, so this row is consistent with the
+        # datum rows (which are computed from the same live state) and with
+        # jacobian() (which reflects Tao's current derivative()).
+        if x is not None:
+            live_x = np.asarray(x, dtype=float)
+        else:
+            live_x = self._current_variable_values()
         var_ix_in_x = {var.name: k for k, var in enumerate(self.variables)}
         J_var = np.zeros((len(self.limit_variables), self.n_var), dtype=float)
         for j, (var, value) in enumerate(
-            zip(self.limit_variables, self._limit_values_from(x_current), strict=True)
+            zip(self.limit_variables, self._limit_values_from(live_x), strict=True)
         ):
             delta = _compute_variable_limit_delta(var, value)
             if delta == 0.0:
@@ -442,6 +448,22 @@ class TaoOptimizationProblem:
             out[j] = x[ix]
         return out
 
+    def _current_variable_values(self) -> np.ndarray:
+        """
+        Read each active variable's current ``model_value`` from Tao.
+
+        Used when :meth:`residual_jacobian` is called without an explicit
+        ``x`` so the limit-variable rows reflect Tao's live state rather than
+        the construction-time ``self.x0``. Costs one pipe call per variable,
+        which is only incurred on that live-state path; the scipy adapters
+        always pass ``x`` explicitly and skip this.
+        """
+        out = np.empty(self.n_var, dtype=float)
+        for i, var in enumerate(self.variables):
+            detail = self.tao.var(var.name)
+            out[i] = float(detail.get("model_value", var.initial_value))
+        return out
+
     def _warn_if_derivative_recalc_off(self) -> None:
         """Emit a one-shot warning if Tao's ``derivative_recalc`` is off."""
         if self._derivative_recalc_warned:
@@ -456,7 +478,7 @@ class TaoOptimizationProblem:
         )
         if not on:
             logger.warning(
-                "Tao's global%%derivative_recalc appears to be False; "
+                "Tao's global%derivative_recalc appears to be False; "
                 "`jacobian()` may return stale entries. Consider "
                 "`tao.cmd('set global derivative_recalc = T')`."
             )
